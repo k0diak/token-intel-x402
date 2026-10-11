@@ -4,7 +4,7 @@ const require = createRequire(`${process.env.HOME}/.config/agent-wallet/node_mod
 const { Wallet, getAddress } = require("ethers");
 
 const ENDPOINT = "https://www.x402scan.com/api/x402/registry/register-origin";
-const ORIGIN = "https://token-intel-x402.echolonius.deno.net";
+const ORIGIN = "https://token-intel.xrpbreadcrumbs.workers.dev";
 
 const w = JSON.parse(readFileSync(`${process.env.HOME}/.config/agent-wallet/wallet.json`, "utf8"));
 const wallet = new Wallet(w.privateKey);

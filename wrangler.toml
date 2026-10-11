@@ -1,0 +1,27 @@
+name = "token-intel"
+main = "src/index.ts"
+compatibility_date = "2026-09-01"
+account_id = "739bdce874726cb34836e2c9df62c464"
+workers_dev = true
+
+# Receive-only wallets. Public addresses — not secrets. Keys never touch this Worker.
+[vars]
+X402_PAY_TO = "0x78eca3731f15B20D2d238DA8E71a4E2716E26cc2"
+X402_SOL_PAY_TO = "4ap5UgKbg8k8fkoyffTdTU4WSth6gMmNue2YE6t3kLj3"
+X402_AMOUNT = "10000" # 0.01 USDC (6 decimals)
+X402_FACILITATOR = "https://facilitator.payai.network"
+
+[[d1_databases]]
+binding = "LEDGER"
+database_name = "token-intel-ledger"
+database_id = "6f1e7ee7-86f1-478a-9cb8-f75003bb5b91"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "416ddf5bf53f47e5ab9ac3d3020c1bff"
+
+# Free routes (demo) only: 10 calls per client per minute. The paid route is never limited.
+[[ratelimits]]
+name = "FREE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 10, period = 60 }

@@ -1,18 +1,18 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
-  "name": "io.github.Echolonius/token-intel",
+  "name": "io.github.k0diak/token-intel",
   "title": "Solana Token Intelligence",
   "description": "Solana token due-diligence: 3-source fused risk verdict incl. LP-lock depth. $0.01 via x402.",
-  "version": "1.2.0",
-  "websiteUrl": "https://token-intel-x402.echolonius.deno.net/llms.txt",
+  "version": "2.0.0",
+  "websiteUrl": "https://token-intel.xrpbreadcrumbs.workers.dev/llms.txt",
   "repository": {
-    "url": "https://github.com/Echolonius/token-intel-x402",
+    "url": "https://github.com/k0diak/token-intel-x402",
     "source": "github"
   },
   "remotes": [
     {
       "type": "streamable-http",
-      "url": "https://token-intel-x402.echolonius.deno.net/mcp"
+      "url": "https://token-intel.xrpbreadcrumbs.workers.dev/mcp"
     }
   ]
 }

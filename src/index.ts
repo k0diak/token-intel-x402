@@ -1,25 +1,62 @@
 /**
- * Solana Token Intelligence — agent-native x402 API. Runs on Deno Deploy (always-on edge,
+ * Solana Token Intelligence — agent-native x402 API. Runs as a Cloudflare Worker (always-on edge,
  * alive when no home machine is on). One keyless call returns a fused safety/quality read on
- * any Solana token, gated behind an x402 micropayment in USDC on Base.
+ * any Solana token, gated behind an x402 micropayment in USDC on Base or Solana.
  *
  * SECURITY POSTURE (by design, not afterthought):
  *   - holds NO private keys and NO API keys — Jupiter (data) and the PayAI facilitator (payment
  *     verify/settle) are both keyless, so there is nothing on this host to steal.
- *   - read-only: only reads public chain/market data and returns JSON. No database, no user
- *     accounts, no PII, no writes — a near-zero attack surface.
- *   - the payTo wallet is RECEIVE-ONLY; its key never leaves the operator's offline machine.
- *   - every paid call requires payment first, so spam/DDoS costs the attacker money.
+ *   - read-only toward the outside world. The only writes are to its own D1 ledger (anonymous
+ *     event counts + payment outcomes; no IPs, no PII) and a KV cache of the free demo.
+ *   - the payTo wallets are RECEIVE-ONLY; their keys never touch this host.
+ *   - every paid call requires payment first, so spam/DDoS costs the attacker money; free routes
+ *     are rate-limited and cached so free traffic can't exhaust the host (what killed v1).
  *   - input is strictly validated (base58 mint only) so it can never be used for SSRF/injection.
  */
 
-const PAY_TO = Deno.env.get("X402_PAY_TO") ?? "0x78eca3731f15B20D2d238DA8E71a4E2716E26cc2";
-const NETWORK = Deno.env.get("X402_NETWORK") ?? "eip155:8453"; // Base mainnet
-const ASSET = Deno.env.get("X402_ASSET") ?? "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC
-const AMOUNT = Deno.env.get("X402_AMOUNT") ?? "10000"; // 0.01 USDC
-const FACILITATOR = Deno.env.get("X402_FACILITATOR") ?? "https://facilitator.payai.network";
-const INDEX_HASH = Deno.env.get("X402INDEX_HASH") ?? "dbe4d192e3b36a2a8494005f9f9396ccad725d267f61c7a4a4d00c97d6ed6442";
+// deno-lint-ignore no-explicit-any
+type Env = Record<string, any>;
+// Config comes from wrangler.toml [vars]; set once per request in the fetch handler.
+let PAY_TO = "", NETWORK = "", ASSET = "", AMOUNT = "", FACILITATOR = "", INDEX_HASH = "";
+let SOL_NETWORK = "", SOL_ASSET = "", SOL_PAY_TO = "";
+function configure(env: Env) {
+  PAY_TO = env.X402_PAY_TO ?? "0x78eca3731f15B20D2d238DA8E71a4E2716E26cc2";
+  NETWORK = env.X402_NETWORK ?? "eip155:8453"; // Base mainnet
+  ASSET = env.X402_ASSET ?? "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC
+  AMOUNT = env.X402_AMOUNT ?? "10000"; // 0.01 USDC
+  FACILITATOR = env.X402_FACILITATOR ?? "https://facilitator.payai.network";
+  INDEX_HASH = env.X402INDEX_HASH ?? "";
+  // Second payment rail: USDC on Solana mainnet (same facilitator, keyless). Solana-native agents
+  // are this product's natural buyers — don't force them onto an EVM chain to pay.
+  SOL_NETWORK = env.X402_SOL_NETWORK ?? "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
+  SOL_ASSET = env.X402_SOL_ASSET ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC mint
+  SOL_PAY_TO = env.X402_SOL_PAY_TO ?? "4ap5UgKbg8k8fkoyffTdTU4WSth6gMmNue2YE6t3kLj3"; // receive-only
+}
 const PRICE_USD = 0.01;
+const SOURCE_URL = "https://github.com/k0diak/token-intel-x402";
+
+// ---------- ledger (D1): the funnel the field study could only estimate ----------
+// One counter row per (day, event). Payment outcomes also get a detail row. Writes go through
+// ctx.waitUntil so they never delay a response, and any ledger failure is swallowed.
+// deno-lint-ignore no-explicit-any
+type Ctx = { waitUntil(p: Promise<any>): void };
+function track(env: Env, ctx: Ctx, event: string, detail?: { network?: string; ok?: boolean; reason?: string }) {
+  if (!env.LEDGER) return;
+  const day = new Date().toISOString().slice(0, 10);
+  const stmts = [env.LEDGER.prepare("INSERT INTO daily (day, event, n) VALUES (?, ?, 1) ON CONFLICT (day, event) DO UPDATE SET n = n + 1").bind(day, event)];
+  if (detail) {
+    stmts.push(env.LEDGER.prepare("INSERT INTO payments (ts, event, network, ok, reason) VALUES (?, ?, ?, ?, ?)")
+      .bind(new Date().toISOString(), event, detail.network ?? null, detail.ok ? 1 : 0, (detail.reason ?? "").slice(0, 200)));
+  }
+  ctx.waitUntil(env.LEDGER.batch(stmts).catch(() => {}));
+}
+// Free routes are what got v1 suspended. Per-client limit via the Workers rate-limit binding;
+// fails open if the binding is absent so a config slip can't take the paid route down.
+async function overLimit(env: Env, req: Request): Promise<boolean> {
+  if (!env.FREE_LIMITER) return false;
+  const key = req.headers.get("CF-Connecting-IP") ?? "anon";
+  try { return !(await env.FREE_LIMITER.limit({ key })).success; } catch { return false; }
+}
 
 const DISCLAIMER =
   "Informational only, not financial advice, no warranty. Scores are heuristic; verify before transacting.";
@@ -172,11 +209,6 @@ const CORS = { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods
 const json = (o: unknown, status = 200, h: Record<string, string> = {}) => new Response(JSON.stringify(o), { status, headers: { "Content-Type": "application/json", ...CORS, ...h } });
 
 const requirements = () => ({ scheme: "exact", network: NETWORK, amount: AMOUNT, asset: ASSET, payTo: PAY_TO, maxTimeoutSeconds: 300, extra: { name: "USD Coin", version: "2" } });
-// Second payment rail: USDC on Solana mainnet (same facilitator, keyless). Solana-native agents
-// are this product's natural buyers — don't force them onto an EVM chain to pay.
-const SOL_NETWORK = Deno.env.get("X402_SOL_NETWORK") ?? "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
-const SOL_ASSET = Deno.env.get("X402_SOL_ASSET") ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC mint
-const SOL_PAY_TO = Deno.env.get("X402_SOL_PAY_TO") ?? "4ap5UgKbg8k8fkoyffTdTU4WSth6gMmNue2YE6t3kLj3"; // receive-only
 const solRequirements = () => ({ scheme: "exact", network: SOL_NETWORK, amount: AMOUNT, asset: SOL_ASSET, payTo: SOL_PAY_TO, maxTimeoutSeconds: 300, extra: { name: "USD Coin" } });
 const allAccepts = () => [requirements(), solRequirements()];
 // Pick the requirements matching the payment payload the buyer actually sent.
@@ -225,6 +257,30 @@ async function facilitator(path: string, paymentPayload: any) {
   let data = null; try { data = await r.json(); } catch { /* */ }
   return { ok: r.ok, status: r.status, data };
 }
+// verify → do the work → settle, shared by REST and MCP. Settling only after the work succeeds
+// means a buyer is never charged for an upstream failure. Every outcome lands in the ledger.
+// deno-lint-ignore no-explicit-any
+async function settlePaid(env: Env, ctx: Ctx, payload: any, work: () => Promise<unknown>): Promise<{ result: unknown; receipt: unknown } | { error: string; upstream?: boolean }> {
+  const network = requirementsFor(payload).network;
+  const v = await facilitator("verify", payload);
+  if (!v.ok || !v.data?.isValid) {
+    const reason = `Payment verification failed: ${v.data?.invalidReason ?? v.status}`;
+    track(env, ctx, "verify_failed", { network, ok: false, reason });
+    return { error: reason };
+  }
+  let result; try { result = await work(); } catch (e) {
+    track(env, ctx, "work_failed", { network, ok: false, reason: (e as Error).message });
+    return { error: (e as Error).message, upstream: true };
+  }
+  const s = await facilitator("settle", payload);
+  if (!s.ok || !s.data?.success) {
+    const reason = `Settlement failed: ${s.data?.errorReason ?? s.status}`;
+    track(env, ctx, "settle_failed", { network, ok: false, reason });
+    return { error: reason };
+  }
+  track(env, ctx, "paid", { network, ok: true, reason: String(s.data?.transaction ?? "") });
+  return { result, receipt: s.data };
+}
 
 // ---------- MCP (stateless streamable HTTP) ----------
 // Survey of live x402+MCP services (glim.sh, pyrimid, aigregator, intelica) settled the shape:
@@ -266,18 +322,24 @@ const toolText = (o: unknown, extra: Record<string, unknown> = {}) => ({
   structuredContent: o,
   ...extra,
 });
-async function demoReport() {
+// Demo is cached in-isolate and in KV (10 min) — Cache API is a no-op on workers.dev, and isolates
+// are short-lived, so KV is what actually keeps free demo traffic off the upstream APIs.
+async function demoReport(env: Env) {
   const DEMO_MINT = "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"; // BONK
   const now = Date.now();
   // deno-lint-ignore no-explicit-any
   const g = globalThis as any;
-  if (!g.__demoCache || now - g.__demoCache.at > 600_000) {
-    g.__demoCache = { at: now, data: await tokenIntel(DEMO_MINT) };
+  if (g.__demoCache && now - g.__demoCache.at < 600_000) return g.__demoCache.data;
+  let data = env.CACHE ? await env.CACHE.get("demo", "json").catch(() => null) : null;
+  if (!data) {
+    data = await tokenIntel(DEMO_MINT);
+    if (env.CACHE) await env.CACHE.put("demo", JSON.stringify(data), { expirationTtl: 600 }).catch(() => {});
   }
-  return g.__demoCache.data;
+  g.__demoCache = { at: now, data };
+  return data;
 }
 // deno-lint-ignore no-explicit-any
-async function mcpHandle(req: Request, url: URL, msg: any): Promise<{ body?: unknown; headers?: Record<string, string> }> {
+async function mcpHandle(req: Request, url: URL, msg: any, env: Env, ctx: Ctx): Promise<{ body?: unknown; headers?: Record<string, string> }> {
   const { id, method, params } = msg ?? {};
   if (typeof method !== "string") return { body: rpcError(id ?? null, -32600, "Invalid request") };
   if (method === "initialize") {
@@ -298,7 +360,9 @@ async function mcpHandle(req: Request, url: URL, msg: any): Promise<{ body?: unk
     const name = params?.name;
     const args = params?.arguments ?? {};
     if (name === "token_intel_demo") {
-      try { return { body: rpcResult(id, toolText({ ...(await demoReport()), _demo: "free fixed-sample (BONK)" })) }; }
+      if (await overLimit(env, req)) return { body: rpcResult(id, toolText({ error: "rate limited — free demo allows a few calls per minute" }, { isError: true })) };
+      track(env, ctx, "mcp_demo");
+      try { return { body: rpcResult(id, toolText({ ...(await demoReport(env)), _demo: "free fixed-sample (BONK)" })) }; }
       catch (e) { return { body: rpcResult(id, toolText({ error: (e as Error).message }, { isError: true })) }; }
     }
     if (name === "token_intel") {
@@ -311,27 +375,50 @@ async function mcpHandle(req: Request, url: URL, msg: any): Promise<{ body?: unk
         accepts: allAccepts(),
       });
       if (!header) {
+        track(env, ctx, "mcp_challenge");
         const d = doc("Payment required — settle these requirements, then retry with the '_payment' argument or X-PAYMENT header");
         return { body: rpcResult(id, toolText(d)), headers: { "PAYMENT-REQUIRED": b64e(d) } };
       }
       if (!isMint(args.mint ?? "")) return { body: rpcResult(id, toolText({ error: "pass mint=<base58 SPL mint>" }, { isError: true })) };
       // deno-lint-ignore no-explicit-any
       let payload: any; try { payload = b64d(header); } catch { return { body: rpcResult(id, toolText(doc("Malformed payment payload"))) }; }
-      const v = await facilitator("verify", payload);
-      if (!v.ok || !v.data?.isValid) return { body: rpcResult(id, toolText(doc(`Payment verification failed: ${v.data?.invalidReason ?? v.status}`))) };
-      let result; try { result = await tokenIntel(args.mint); } catch (e) { return { body: rpcResult(id, toolText({ error: (e as Error).message }, { isError: true })) }; }
-      const s = await facilitator("settle", payload);
-      if (!s.ok || !s.data?.success) return { body: rpcResult(id, toolText(doc(`Settlement failed: ${s.data?.errorReason ?? s.status}`))) };
-      return { body: rpcResult(id, toolText(result)), headers: { "PAYMENT-RESPONSE": b64e(s.data) } };
+      const paid = await settlePaid(env, ctx, payload, () => tokenIntel(args.mint));
+      if ("error" in paid) return { body: rpcResult(id, toolText(paid.upstream ? { error: paid.error } : doc(paid.error), paid.upstream ? { isError: true } : {})) };
+      return { body: rpcResult(id, toolText(paid.result)), headers: { "PAYMENT-RESPONSE": b64e(paid.receipt) } };
     }
     return { body: rpcError(id, -32602, `Unknown tool: ${String(name)}`) };
   }
   return { body: rpcError(id, -32601, `Method not found: ${method}`) };
 }
 
-Deno.serve(async (req) => {
+export default {
+  async fetch(req: Request, env: Env, ctx: Ctx): Promise<Response> {
+    configure(env);
+    return await route(req, env, ctx);
+  },
+};
+
+// Public funnel numbers — radical bookkeeping: anyone can see what the service actually earns.
+async function stats(env: Env) {
+  if (!env.LEDGER) return { error: "ledger not configured" };
+  const totals = await env.LEDGER.prepare("SELECT event, SUM(n) AS n FROM daily GROUP BY event ORDER BY n DESC").all();
+  const last7 = await env.LEDGER.prepare("SELECT day, event, n FROM daily WHERE day >= date('now', '-7 days') ORDER BY day DESC, n DESC").all();
+  const paid = await env.LEDGER.prepare("SELECT COUNT(*) AS calls FROM payments WHERE event = 'paid'").first();
+  return {
+    revenueUsd: Number(((paid?.calls ?? 0) * PRICE_USD).toFixed(2)),
+    paidCalls: paid?.calls ?? 0,
+    allTime: totals.results,
+    last7Days: last7.results,
+    note: "Event counts only — no IPs or client identifiers are stored.",
+  };
+}
+
+async function route(req: Request, env: Env, ctx: Ctx): Promise<Response> {
   const url = new URL(req.url);
   if (req.method === "OPTIONS") return new Response(null, { status: 204, headers: CORS });
+  if (url.pathname === "/stats") {
+    try { return json(await stats(env), 200, { "Cache-Control": "public, max-age=60" }); } catch (e) { return json({ error: (e as Error).message }, 500); }
+  }
 
   if (url.pathname === "/mcp") {
     if (req.method !== "POST") return json({ error: "POST JSON-RPC only (stateless streamable HTTP; no SSE stream offered)" }, 405, { "Allow": "POST, OPTIONS" });
@@ -340,7 +427,7 @@ Deno.serve(async (req) => {
     const msgs = Array.isArray(msg) ? msg : [msg];
     const outs: unknown[] = []; const hdrs: Record<string, string> = {};
     for (const m of msgs) {
-      const r = await mcpHandle(req, url, m);
+      const r = await mcpHandle(req, url, m, env, ctx);
       if (r.body !== undefined) outs.push(r.body);
       Object.assign(hdrs, r.headers ?? {});
     }
@@ -354,7 +441,7 @@ Deno.serve(async (req) => {
       { headers: { "Content-Type": "image/svg+xml", "Cache-Control": "public, max-age=86400", ...CORS } },
     );
   }
-  if (url.pathname === "/.well-known/402index-verify.txt") return new Response(INDEX_HASH, { headers: { "Content-Type": "text/plain", ...CORS } });
+  if (url.pathname === "/.well-known/402index-verify.txt" && INDEX_HASH) return new Response(INDEX_HASH, { headers: { "Content-Type": "text/plain", ...CORS } });
 
   // Discovery documents (x402scan + any crawler): OpenAPI-first, .well-known fan-out as fallback.
   if (url.pathname === "/.well-known/x402") {
@@ -366,7 +453,7 @@ Deno.serve(async (req) => {
       `# Solana Token Intelligence (token-intel-x402)
 
 > One paid call returns a fused safety + market read on any Solana token — mint/freeze authorities,
-> holder concentration, dev holdings, organic (wash-trade) score, liquidity cross-checked across two
+> holder concentration, dev holdings, organic (wash-trade) score, liquidity cross-checked across three
 > independent sources — synthesized into a 0-100 risk score and a low-risk/caution/high-risk verdict.
 > Built for autonomous agents: pay per call ($0.01 USDC on Base or Solana via x402 v2), no API key,
 > no account, no signup. ${DISCLAIMER}
@@ -386,7 +473,7 @@ Deno.serve(async (req) => {
 - OpenAPI: ${url.origin}/openapi.json
 - x402 discovery: ${url.origin}/.well-known/x402
 - A2A agent card: ${url.origin}/.well-known/agent.json
-- Source: https://github.com/Echolonius/token-intel-x402
+- Source: ${SOURCE_URL}
 `,
       { headers: { "Content-Type": "text/plain; charset=utf-8", ...CORS } },
     );
@@ -398,7 +485,7 @@ Deno.serve(async (req) => {
       description: DESC,
       url: url.origin,
       version: "1.2.0",
-      provider: { organization: "Echolonius", url: "https://github.com/Echolonius/token-intel-x402" },
+      provider: { organization: "k0diak", url: SOURCE_URL },
       iconUrl: `${url.origin}/favicon.svg`,
       documentationUrl: `${url.origin}/llms.txt`,
       capabilities: { streaming: false, pushNotifications: false },
@@ -421,11 +508,11 @@ Deno.serve(async (req) => {
         title: "Solana Token Intelligence",
         version: "1.0.0",
         description: DESC,
-        contact: { name: "Echolonius", url: "https://github.com/Echolonius/token-intel-x402" },
+        contact: { name: "k0diak", url: SOURCE_URL },
         "x-guidance": "Pay-per-call, no account, no API key. GET /api/token-intel?mint=<base58 SPL mint> with an x402 v2 payment ($0.01 USDC on Base or Solana). Unpaid calls return 402 with full requirements in body and PAYMENT-REQUIRED header. MCP: POST /mcp (stateless streamable HTTP, no session; tools: token_intel paid, token_intel_demo free; unpaid calls return x402 requirements in-band; pay via '_payment' argument or X-PAYMENT header). Free: GET / (index), GET /healthz, and GET /api/token-intel/demo (fixed BONK sample of the full three-source output).",
       },
       servers: [{ url: url.origin }],
-      "x-discovery": { contact: { url: "https://github.com/Echolonius/token-intel-x402" } },
+      "x-discovery": { contact: { url: SOURCE_URL } },
       paths: {
         "/api/token-intel": {
           get: {
@@ -459,8 +546,10 @@ Deno.serve(async (req) => {
   // Free fixed-sample demo (BONK only, cached 10 min): buyers see real output before paying,
   // and it exercises the full intel pipeline in production without touching the paid gate.
   if (url.pathname === "/api/token-intel/demo") {
+    if (await overLimit(env, req)) return json({ error: "rate limited — the free demo allows a few calls per minute; the paid route is unlimited" }, 429, { "Retry-After": "60" });
+    track(env, ctx, "demo");
     try {
-      return json({ ...(await demoReport()), _demo: "free fixed-sample (BONK). Any other mint: GET /api/token-intel?mint=<mint> with x402 payment ($0.01 USDC on Base or Solana)." });
+      return json({ ...(await demoReport(env)), _demo: "free fixed-sample (BONK). Any other mint: GET /api/token-intel?mint=<mint> with x402 payment ($0.01 USDC on Base or Solana)." });
     } catch (e) { return json({ error: (e as Error).message }, 502); }
   }
 
@@ -470,17 +559,14 @@ Deno.serve(async (req) => {
     // Payment challenge FIRST (even on a bare probe with no params) — unpaid callers and
     // discovery crawlers must always see the 402 requirements, never a 400.
     const header = req.headers.get("PAYMENT-SIGNATURE") ?? req.headers.get("X-PAYMENT");
-    if (!header) return require402(resource);
+    if (!header) { track(env, ctx, "challenge"); return require402(resource); }
     if (!isMint(mint)) return json({ error: 'pass ?mint=<base58 SPL mint>' }, 400);
     // deno-lint-ignore no-explicit-any
     let payload: any; try { payload = b64d(header); } catch { return require402(resource, "Malformed payment header"); }
-    const v = await facilitator("verify", payload);
-    if (!v.ok || !v.data?.isValid) return require402(resource, `Payment verification failed: ${v.data?.invalidReason ?? v.status}`);
-    let result; try { result = await tokenIntel(mint); } catch (e) { return json({ error: (e as Error).message }, 502); }
-    const s = await facilitator("settle", payload);
-    if (!s.ok || !s.data?.success) return require402(resource, `Settlement failed: ${s.data?.errorReason ?? s.status}`);
-    return json(result, 200, { "PAYMENT-RESPONSE": b64e(s.data) });
+    const paid = await settlePaid(env, ctx, payload, () => tokenIntel(mint));
+    if ("error" in paid) return paid.upstream ? json({ error: paid.error }, 502) : require402(resource, paid.error);
+    return json(paid.result, 200, { "PAYMENT-RESPONSE": b64e(paid.receipt) });
   }
 
   return json({ error: "not found" }, 404);
-});
+}
