@@ -13,7 +13,7 @@
  *   - input is strictly validated (base58 mint only) so it can never be used for SSRF/injection.
  */
 
-const PAY_TO = Deno.env.get("X402_PAY_TO") ?? "0xd194AB36E66BccDD80f19b56757CFe52EdEd49af";
+const PAY_TO = Deno.env.get("X402_PAY_TO") ?? "0x6536233ab0415daae98c6e66b87e3d4e20d4e3cd";
 const NETWORK = Deno.env.get("X402_NETWORK") ?? "eip155:8453"; // Base mainnet
 const ASSET = Deno.env.get("X402_ASSET") ?? "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC
 const AMOUNT = Deno.env.get("X402_AMOUNT") ?? "10000"; // 0.01 USDC
@@ -176,7 +176,7 @@ const requirements = () => ({ scheme: "exact", network: NETWORK, amount: AMOUNT,
 // are this product's natural buyers — don't force them onto an EVM chain to pay.
 const SOL_NETWORK = Deno.env.get("X402_SOL_NETWORK") ?? "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp";
 const SOL_ASSET = Deno.env.get("X402_SOL_ASSET") ?? "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"; // USDC mint
-const SOL_PAY_TO = Deno.env.get("X402_SOL_PAY_TO") ?? "3wbinZDnWmDxHMLtACNrskwZvRwg4KYbBWw1wuviXXHT"; // receive-only
+const SOL_PAY_TO = Deno.env.get("X402_SOL_PAY_TO") ?? "2qm6YKKWZUiLiHSjMxch5GXcygkLPDgKgrZLoCmFRJbQ"; // receive-only
 const solRequirements = () => ({ scheme: "exact", network: SOL_NETWORK, amount: AMOUNT, asset: SOL_ASSET, payTo: SOL_PAY_TO, maxTimeoutSeconds: 300, extra: { name: "USD Coin" } });
 const allAccepts = () => [requirements(), solRequirements()];
 // Pick the requirements matching the payment payload the buyer actually sent.
