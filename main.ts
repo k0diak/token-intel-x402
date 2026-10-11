@@ -13,7 +13,7 @@
  *   - input is strictly validated (base58 mint only) so it can never be used for SSRF/injection.
  */
 
-const PAY_TO = Deno.env.get("X402_PAY_TO") ?? "0x6536233ab0415daae98c6e66b87e3d4e20d4e3cd";
+const PAY_TO = Deno.env.get("X402_PAY_TO") ?? "0x78eca3731f15B20D2d238DA8E71a4E2716E26cc2";
 const NETWORK = Deno.env.get("X402_NETWORK") ?? "eip155:8453"; // Base mainnet
 const ASSET = Deno.env.get("X402_ASSET") ?? "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC
 const AMOUNT = Deno.env.get("X402_AMOUNT") ?? "10000"; // 0.01 USDC
